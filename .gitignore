@@ -14,6 +14,12 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# MSIX 成品与签名证书（证书绝不入库！）
+msix/*.msix
+msix/*.pfx
+msix/*.cer
+*.appx
+
 # 编辑器 / IDE
 .vscode/
 .idea/

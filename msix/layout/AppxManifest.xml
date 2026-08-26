@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+
+  <!-- Microsoft Store (Partner Center) 分配的包标识 -->
+  <Identity
+    Name="Lawrence7YY.BtBatteryBar"
+    Publisher="CN=B2250643-15B9-4016-82B3-C97EAFA5DABD"
+    Version="0.1.0.0" />
+
+  <Properties>
+    <DisplayName>BtBatteryBar</DisplayName>
+    <PublisherDisplayName>Lawrence7YY</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="zh-cn" />
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="App"
+                 Executable="bt-battery-bar.exe"
+                 EntryPoint="windows.fullTrustApplication">
+      <uap:VisualElements
+        DisplayName="BtBatteryBar"
+        Description="轻量级 Windows 任务栏蓝牙/2.4G 设备电量显示条"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile ShortName="BtBatteryBar" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- 桌面桥：Win32 应用以完全信任运行 -->
+    <rescap:Capability Name="runFullTrust" />
+    <DeviceCapability Name="bluetooth" />
+  </Capabilities>
+</Package>
