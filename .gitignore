@@ -1,0 +1,20 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 构建好的二进制与安装包（请通过 GitHub Releases 分发）
+/release/*.exe
+/release/*.zip
+/dist/*.exe
+/dist/*.zip
+/installer/*.exe
+
+# 系统杂项
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp

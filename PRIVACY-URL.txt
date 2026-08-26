@@ -1,0 +1,14 @@
+BtBatteryBar 隐私策略 URL / Privacy Policy URL
+================================================
+
+发布到应用商店或签名平台时，请填写以下 URL：
+
+https://github.com/Lawrence7y/bt-battery-bar/blob/main/PRIVACY.md
+
+如果启用了 GitHub Pages（链接更简洁）：
+https://lawrence7y.github.io/bt-battery-bar/PRIVACY.html
+
+对应源文件：PRIVACY.md（位于仓库根目录）
+
+启用 GitHub Pages 的方法：
+  仓库 → Settings → Pages → Source 选择 "GitHub Actions" 或 "Deploy from a branch" (main / root)
