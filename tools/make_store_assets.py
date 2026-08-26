@@ -1,0 +1,320 @@
+"""Compose Microsoft Store listing images for BtBatteryBar.
+
+Inputs:
+  - real app strip render (chroma-keyed magenta bg) from %LOCALAPPDATA%\\BtBatteryBar\\strip-self.bmp
+  - custom artwork PNG (transparent bg) provided by the user
+
+Outputs (msix/store/):
+  - screenshot-1.png / screenshot-2.png / screenshot-3.png  (1920x1080)
+  - poster-9x16.png      (720x1080)
+  - boxart-1x1.png       (1080x1080)
+  - hero-16x9.png        (1920x1080, no product name)
+  - tile-300.png / tile-150.png / tile-71.png
+"""
+
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+HERE = Path(__file__).resolve().parent.parent
+STORE = HERE / "msix" / "store"
+STRIP_SRC = Path(r"C:/Users/Administrator/AppData/Local/BtBatteryBar/strip-self.bmp")
+ART_SRC = Path(r"D:/bingdown/ChatGPT Image 2026年8月26日 10_20_24 (2).png")
+WIDE_ART_SRC = Path(r"D:\bingdown\ChatGPT Image 2026年8月26日 10_20_23 (1).png")
+
+F_BOLD = "C:/Windows/Fonts/segoeuib.ttf"
+F_REG = "C:/Windows/Fonts/segoeui.ttf"
+
+MAGENTA = (255, 0, 255)
+
+
+def load_strip() -> Image.Image:
+    """Load the real strip render and turn the magenta key into transparency."""
+    im = Image.open(STRIP_SRC).convert("RGB")
+    px = im.load()
+    out = Image.new("RGBA", im.size)
+    po = out.load()
+    for y in range(im.height):
+        for x in range(im.width):
+            r, g, b = px[x, y]
+            if (r, g, b) == MAGENTA:
+                po[x, y] = (0, 0, 0, 0)
+            else:
+                po[x, y] = (r, g, b, 255)
+    return out
+
+
+def load_art() -> Image.Image:
+    art = Image.open(ART_SRC).convert("RGBA")
+    bbox = art.getbbox()
+    art = art.crop(bbox)
+    side = max(art.size)
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.paste(art, ((side - art.width) // 2, (side - art.height) // 2), art)
+    return canvas
+
+
+def wallpaper(w: int, h: int) -> Image.Image:
+    """Windows-11-style dark bloom wallpaper."""
+    img = Image.new("RGB", (w, h), (12, 16, 32))
+    dr = ImageDraw.Draw(img)
+    blobs = [
+        (int(w * 0.68), int(h * 0.42), int(h * 0.55), (28, 84, 200)),
+        (int(w * 0.30), int(h * 0.70), int(h * 0.50), (16, 48, 130)),
+        (int(w * 0.80), int(h * 0.75), int(h * 0.40), (10, 120, 220)),
+        (int(w * 0.15), int(h * 0.20), int(h * 0.35), (60, 40, 160)),
+    ]
+    layer = Image.new("RGB", (w, h), (12, 16, 32))
+    ld = ImageDraw.Draw(layer)
+    for cx, cy, r, col in blobs:
+        ld.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col)
+    layer = layer.filter(ImageFilter.GaussianBlur(int(h * 0.09)))
+    img = Image.blend(img, layer, 0.85)
+    # subtle vignette
+    vig = Image.new("L", (w, h), 0)
+    vd = ImageDraw.Draw(vig)
+    vd.ellipse([-w * 0.3, -h * 0.4, w * 1.3, h * 1.4], fill=90)
+    vig = vig.filter(ImageFilter.GaussianBlur(int(h * 0.2)))
+    dark = Image.new("RGB", (w, h), (5, 7, 18))
+    img = Image.composite(img, dark, vig.point(lambda v: 255 - v))
+    return img
+
+
+TASKBAR_H = 56
+
+
+def draw_taskbar(img: Image.Image, strip: Image.Image, scale: float):
+    """Draw a Win11-style dark taskbar with centered icons + tray; paste the real strip."""
+    w, h = img.size
+    dr = ImageDraw.Draw(img, "RGBA")
+    ty = h - TASKBAR_H
+    dr.rectangle([0, ty, w, h], fill=(28, 28, 32, 242))
+    dr.line([(0, ty), (w, ty)], fill=(255, 255, 255, 26))
+
+    # centered placeholder taskbar icons
+    n, isize, gap = 9, 34, 14
+    total = n * isize + (n - 1) * gap
+    x0 = (w - total) // 2
+    palette = [(0, 120, 212), (134, 88, 208), (226, 96, 46), (22, 150, 110),
+               (240, 180, 40), (80, 90, 240), (200, 60, 90), (60, 140, 220), (150, 150, 158)]
+    cy = ty + TASKBAR_H // 2
+    for i in range(n):
+        cx = x0 + i * (isize + gap) + isize // 2
+        col = palette[i]
+        if i % 3 == 0:
+            dr.rounded_rectangle([cx - isize // 2, cy - isize // 2, cx + isize // 2, cy + isize // 2],
+                                 radius=8, fill=col + (235,))
+        elif i % 3 == 1:
+            dr.ellipse([cx - isize // 2, cy - isize // 2, cx + isize // 2, cy + isize // 2], fill=col + (235,))
+            dr.ellipse([cx - isize // 4, cy - isize // 4, cx + isize // 4, cy + isize // 4],
+                       fill=(28, 28, 32, 255))
+        else:
+            dr.polygon([(cx - isize // 2, cy + isize // 2), (cx + isize // 2, cy + isize // 2),
+                        (cx, cy - isize // 2)], fill=col + (235,))
+        if i == 1:  # active underline
+            dr.rounded_rectangle([cx - 10, h - 4, cx + 10, h - 1], radius=2, fill=(90, 170, 255, 255))
+
+    f_time = ImageFont.truetype(F_REG, 13)
+
+    def text_r(x_right, s, font=None):
+        f = font or f_time
+        bb = dr.textbbox((0, 0), s, font=f)
+        dr.text((x_right - (bb[2] - bb[0]), cy - (bb[3] - bb[1]) / 2 - bb[1]), s,
+                font=f, fill=(235, 235, 235, 255))
+
+    # tray: chevron ^, wifi, volume, clock
+    text_r(w - 12, "2026/08/26")
+    bw = dr.textbbox((0, 0), "2026/08/26", font=f_time)[2]
+    text_r(w - 12 - bw - 10, "10:20")
+    bx = w - 12 - bw - 10 - 78
+    for k, col in enumerate([(200, 200, 205)]):
+        dr.polygon([(bx + k * 18, cy - 2), (bx + 6 + k * 18, cy - 8), (bx + 12 + k * 18, cy - 2)],
+                   outline=col + (230,), width=2)
+
+    # the REAL strip, left of tray
+    sh = 38
+    sw = int(strip.width * sh / strip.height)
+    st = strip.resize((sw, sh), Image.LANCZOS)
+    img.alpha_composite(st, (bx - 46 - sw, ty + (TASKBAR_H - sh) // 2))
+
+
+def screenshot_full(strip: Image.Image) -> Image.Image:
+    img = wallpaper(1920, 1080).convert("RGBA")
+    # desktop hint: a couple of soft window cards
+    dr = ImageDraw.Draw(img, "RGBA")
+    dr.rounded_rectangle([140, 120, 900, 700], radius=12, fill=(30, 36, 52, 200),
+                         outline=(255, 255, 255, 24), width=1)
+    dr.rounded_rectangle([160, 165, 880, 660], radius=8, fill=(22, 27, 40, 220))
+    ft = ImageFont.truetype(F_REG, 20)
+    dr.text((185, 132), "Documents", font=ft, fill=(210, 214, 222, 255))
+    draw_taskbar(img, strip, 1.0)
+    return img.convert("RGB")
+
+
+def screenshot_zoom(strip: Image.Image) -> Image.Image:
+    """Close-up of the right side of the taskbar with the strip at native size."""
+    img = wallpaper(1920, 1080).resize((1920, 1080)).convert("RGBA")
+    draw_taskbar(img, strip, 1.0)
+    # crop around the strip area then upscale
+    w, h = img.size
+    crop_box = (w - 1000, h - TASKBAR_H - 130, w - 60, h)
+    region = img.crop(crop_box).resize((1920, 1080), Image.LANCZOS)
+    return region.convert("RGB")
+
+
+def light_variant(strip_dark: Image.Image) -> Image.Image:
+    """Recolor the dark strip into a light-theme variant (bg<->text swap)."""
+    im = strip_dark.copy()
+    px = im.load()
+    for y in range(im.height):
+        for x in range(im.width):
+            r, g, b, a = px[x, y]
+            if a == 0:
+                continue
+            lum = (r + g + b) / 3
+            if lum < 60:                      # dark background -> light surface
+                px[x, y] = (243, 243, 245, a)
+            elif lum > 190:                   # white text -> near-black
+                px[x, y] = (32, 32, 36, a)
+            elif 60 <= lum <= 120:            # mid grays -> medium gray
+                px[x, y] = (110, 112, 118, a)
+    return im
+
+
+def gradient_bg(w: int, h: int, top, bot) -> Image.Image:
+    img = Image.new("RGB", (w, h))
+    dr = ImageDraw.Draw(img)
+    for y in range(h):
+        t = y / max(h - 1, 1)
+        dr.line([(0, y), (w, y)],
+                fill=tuple(int(top[i] + (bot[i] - top[i]) * t) for i in range(3)))
+    return img.convert("RGBA")
+
+
+def poster(strip: Image.Image, art: Image.Image) -> Image.Image:
+    """9:16 poster art, 720x1080 — includes product title."""
+    img = gradient_bg(720, 1080, (74, 162, 232), (0, 80, 170)).convert("RGBA")
+    dr = ImageDraw.Draw(img, "RGBA")
+    # glow behind artwork
+    glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([360 - 300, 400 - 300, 360 + 300, 400 + 300], fill=(160, 215, 255, 110))
+    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(60)))
+
+    a = art.resize((520, 520), Image.LANCZOS)
+    img.alpha_composite(a, (100, 130))
+
+    f_title = ImageFont.truetype(F_BOLD, 64)
+    f_sub_en = ImageFont.truetype(F_REG, 26)
+    f_sub_cn = ImageFont.truetype("C:/Windows/Fonts/msyhbd.ttc", 24)
+    title = "BtBatteryBar"
+    bb = dr.textbbox((0, 0), title, font=f_title)
+    tx = (720 - bb[2]) // 2
+    dr.text((tx + 2, 706), title, font=f_title, fill=(8, 40, 90, 160))   # soft shadow
+    dr.text((tx, 704), title, font=f_title, fill=(255, 255, 255, 255))
+    sub = "Taskbar battery for Bluetooth & 2.4G devices"
+    bb2 = dr.textbbox((0, 0), sub, font=f_sub_en)
+    dr.text(((720 - bb2[2]) // 2, 800), sub, font=f_sub_en, fill=(225, 240, 255, 255))
+    sub2 = "任务栏蓝牙 · 2.4G 设备电量条"
+    bb3 = dr.textbbox((0, 0), sub2, font=f_sub_cn)
+    dr.text(((720 - bb3[2]) // 2, 844), sub2, font=f_sub_cn, fill=(200, 228, 255, 235))
+
+    # real strip floating at bottom
+    sh = 54
+    sw = int(strip.width * sh / strip.height)
+    st = strip.resize((sw, sh), Image.LANCZOS)
+    card = Image.new("RGBA", (sw + 36, sh + 28), (16, 18, 26, 215))
+    cdr = ImageDraw.Draw(card)
+    cdr.rounded_rectangle([0, 0, card.width - 1, card.height - 1], radius=14, outline=(255, 255, 255, 45), width=1)
+    card.alpha_composite(st, (18, 14))
+    img.alpha_composite(card, ((720 - card.width) // 2, 930))
+    return img.convert("RGB")
+
+
+def boxart(strip: Image.Image, art: Image.Image) -> Image.Image:
+    """1:1 box art, 1080x1080 — title inside upper 3/4."""
+    img = gradient_bg(1080, 1080, (58, 148, 226), (0, 66, 150)).convert("RGBA")
+    dr = ImageDraw.Draw(img, "RGBA")
+    glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([540 - 430, 480 - 430, 540 + 430, 480 + 430], fill=(150, 212, 255, 105))
+    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(80)))
+
+    a = art.resize((640, 640), Image.LANCZOS)
+    img.alpha_composite(a, (220, 250))
+
+    f_title = ImageFont.truetype(F_BOLD, 92)
+    title = "BtBatteryBar"
+    bb = dr.textbbox((0, 0), title, font=f_title)
+    tx = (1080 - bb[2]) // 2
+    dr.text((tx + 3, 92), title, font=f_title, fill=(6, 34, 80, 170))
+    dr.text((tx, 88), title, font=f_title, fill=(255, 255, 255, 255))
+    f_sub_cn = ImageFont.truetype("C:/Windows/Fonts/msyhbd.ttc", 34)
+    sub = "任务栏蓝牙 · 2.4G 设备电量条"
+    bb2 = dr.textbbox((0, 0), sub, font=f_sub_cn)
+    dr.text(((1080 - bb2[2]) // 2, 218), sub, font=f_sub_cn, fill=(222, 240, 255, 245))
+
+    sh = 64
+    sw = int(strip.width * sh / strip.height)
+    st = strip.resize((sw, sh), Image.LANCZOS)
+    card = Image.new("RGBA", (sw + 40, sh + 32), (16, 18, 26, 215))
+    c = ImageDraw.Draw(card)
+    c.rounded_rectangle([0, 0, card.width - 1, card.height - 1], radius=16, outline=(255, 255, 255, 45), width=1)
+    card.alpha_composite(st, (20, 16))
+    img.alpha_composite(card, ((1080 - card.width) // 2, 940))
+    return img.convert("RGB")
+
+
+def hero(strip: Image.Image, art: Image.Image) -> Image.Image:
+    """16:9 hero image, 1920x1080 — must NOT contain the product name."""
+    img = gradient_bg(1920, 1080, (40, 120, 210), (4, 44, 120)).convert("RGBA")
+    dr = ImageDraw.Draw(img, "RGBA")
+    glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([1380 - 520, 500 - 520, 1380 + 520, 500 + 520], fill=(140, 208, 255, 95))
+    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(100)))
+
+    a = art.resize((760, 760), Image.LANCZOS)
+    img.alpha_composite(a, (1290, 190))
+
+    # big real strip on the left as the product UI statement
+    sh = 96
+    sw = int(strip.width * sh / strip.height)
+    st = strip.resize((sw, sh), Image.LANCZOS)
+    card = Image.new("RGBA", (sw + 72, sh + 60), (16, 18, 26, 220))
+    c = ImageDraw.Draw(card)
+    c.rounded_rectangle([0, 0, card.width - 1, card.height - 1], radius=22, outline=(255, 255, 255, 50), width=2)
+    card.alpha_composite(st, (36, 30))
+    img.alpha_composite(card, (170, 470))
+    return img.convert("RGB")
+
+
+def main():
+    STORE.mkdir(parents=True, exist_ok=True)
+    strip = load_strip()
+    art = load_art()
+    strip_light = light_variant(strip)
+
+    out = {
+        "screenshot-1.png": screenshot_full(strip),
+        "screenshot-2.png": screenshot_zoom(strip),
+        "poster-9x16.png": poster(strip, art),
+        "boxart-1x1.png": boxart(strip, art),
+        "hero-16x9.png": hero(strip, art),
+    }
+    for name, im in out.items():
+        im.save(STORE / name)
+        print(name, im.size)
+
+    # Store display tiles from the user's own artwork
+    tiles = {"tile-icon-300x300.png": 300, "tile-150x150.png": 150, "tile-71x71.png": 71}
+    for name, s in tiles.items():
+        art.resize((s, s), Image.LANCZOS).save(STORE / name)
+        print(name, (s, s))
+
+    # keep light strip variant for reference
+    strip_light.save(STORE / "_strip-light.png")
+
+
+if __name__ == "__main__":
+    main()
