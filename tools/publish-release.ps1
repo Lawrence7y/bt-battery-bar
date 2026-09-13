@@ -72,14 +72,18 @@ if ($auth -match "not logged into") {
 }
 
 # ---- create the release ----
-$args = @("release", "create", $tag, "--title", $tag, "--notes-file", $NotesFile)
-if ($Draft) { $args += "--draft" }
-foreach ($a in $assets) { $args += $a }
-Write-Host "==> gh $($args -join ' ')"
-Invoke-Native "gh release create failed" { & gh @args }
+# NOTE: use a named variable, not $args: inside a scriptblock $args is the
+# scriptblock's own (empty) argument list, which silently turned into `gh` with
+# no arguments printing its help text.
+$ghArgs = @("release", "create", $tag, "--title", $tag, "--notes-file", $NotesFile)
+if ($Draft) { $ghArgs += "--draft" }
+foreach ($a in $assets) { $ghArgs += $a }
+Write-Host "==> gh $($ghArgs -join ' ')"
+Invoke-Native "gh release create failed" { & gh @ghArgs }
 
 Write-Host ""
 Write-Host "==> published:"
-& gh release view $tag --json url, name, assets --template '{{.name}}  {{.url}}
+# --json takes one comma-separated argument (spaces would split it into three).
+& gh release view $tag --json "url,name,assets" --template '{{.name}}  {{.url}}
 {{range .assets}}  - {{.name}}  ({{.size}} bytes)
 {{end}}'
