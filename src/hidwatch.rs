@@ -11,8 +11,8 @@ use windows::Win32::Devices::HumanInterfaceDevice::{HidD_FlushQueue, HidD_SetNum
 use windows::Win32::Foundation::CloseHandle;
 
 use crate::hid::{
-    HidDevice, devices_from_raw, enumerate_ex, is_compx_vid, is_io_pending, is_sonix_vid,
-    is_vendor_page, list_hid_paths, note_live_battery, open_hid, overlapped_read,
+    HidDevice, devices_from_raw, enumerate_ex, is_compx_vid, is_hidpp_vid, is_io_pending,
+    is_sonix_vid, is_vendor_page, list_hid_paths, note_live_battery, open_hid, overlapped_read,
     parse_sonix_battery, poke_sonix_status, probe_one, query_compx_battery, query_via_alive,
     query_via_battery, sonix_rf_alive, to_hex,
 };
@@ -29,6 +29,8 @@ enum WatchKind {
     SonixStatus,
     SonixVia,
     CompxBattery,
+    /// 罗技 HID++ 特征查询（0x1002/0x1000/0x1001）。
+    HidppBattery,
 }
 
 pub struct Watcher {
@@ -80,6 +82,12 @@ fn watch_kind(d: &HidDevice) -> Option<WatchKind> {
         && (d.input_len == 17 || d.input_len == 20 || d.output_len == 17 || d.output_len == 20)
     {
         return Some(WatchKind::CompxBattery);
+    }
+    // 罗技 HID++（Unifying / Lightspeed / 有线）。此前只有 CLI 的
+    // `enumerate(query=true)` 会查它，GUI 从不调用，于是 README/商店描述里的
+    // “罗技支持”在用户实际运行的界面里永远是 `--`。
+    if is_hidpp_vid(d.vid) {
+        return Some(WatchKind::HidppBattery);
     }
     None
 }
@@ -205,6 +213,7 @@ fn spawn_child(
         WatchKind::SonixStatus => "hid-sonix",
         WatchKind::SonixVia => "hid-via",
         WatchKind::CompxBattery => "hid-compx",
+        WatchKind::HidppBattery => "hid-hidpp",
     };
     let _ = thread::Builder::new().name(name.into()).spawn(move || {
         while !parent_stop.load(Ordering::SeqCst) && !child_stop.load(Ordering::SeqCst) {
@@ -239,6 +248,14 @@ fn spawn_child(
                     &*on_update,
                 ),
                 WatchKind::CompxBattery => watch_compx(
+                    handle,
+                    &d,
+                    &parent_stop,
+                    &child_stop,
+                    &last_raw,
+                    &*on_update,
+                ),
+                WatchKind::HidppBattery => watch_hidpp(
                     handle,
                     &d,
                     &parent_stop,
@@ -422,6 +439,34 @@ fn watch_via(
         }
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(12) && !stopped(parent_stop, child_stop) {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// HID++ 查询周期：接收器对特征请求的响应很快，30s 一次足够反映真实电量变化，
+/// 也不会给无线链路增加可感知负担（失败会被 hidpp 内部的 DEAD_TTL 缓存挡掉）。
+const HIDPP_PERIOD: Duration = Duration::from_secs(30);
+
+/// 罗技 HID++：周期性地读 Unified Battery / Battery Status / Battery Level Status。
+/// 成功即 note_live_battery（hidpp 内部完成）并立即重绘，与其它 2.4G 路径一致。
+fn watch_hidpp(
+    handle: windows::Win32::Foundation::HANDLE,
+    d: &HidDevice,
+    parent_stop: &AtomicBool,
+    child_stop: &AtomicBool,
+    last_raw: &Mutex<Vec<HidDevice>>,
+    on_update: &dyn Fn(Vec<Device>),
+) {
+    while !stopped(parent_stop, child_stop) {
+        if let Some(pct) =
+            crate::hidpp::query_battery(handle, d.input_len, d.output_len, d.vid, d.pid)
+        {
+            crate::dblog::log(&format!("hidpp {:04X}:{:04X} battery={pct}%", d.vid, d.pid));
+            publish(last_raw, on_update);
+        }
+        let start = Instant::now();
+        while start.elapsed() < HIDPP_PERIOD && !stopped(parent_stop, child_stop) {
             thread::sleep(Duration::from_millis(100));
         }
     }

@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Device;
 
+/// 记住的设备上限（超出后淘汰最旧的）。
+const MAX_KNOWN_DEVICES: usize = 40;
+
+/// 条内文字基准百分比（100 = 96 DPI 下的设计值）。
+pub const DEFAULT_TEXT_PCT: u32 = 100;
+/// 允许的字号范围：太小看不清，太大条会挤爆任务栏。
+pub const MIN_TEXT_PCT: u32 = 70;
+pub const MAX_TEXT_PCT: u32 = 160;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct KnownDevice {
@@ -46,6 +55,9 @@ pub struct Settings {
     pub known_devices: Vec<KnownDevice>,
     /// Taskbar dock: "left" or "right" (default).
     pub strip_side: String,
+    /// 条内文字/间距的缩放百分比（相对 96 DPI 设计值），默认 100。
+    /// 用户抱怨过 150% 缩放下字太大，因此给出 80/100/120/140 四档（菜单"字号"）。
+    pub text_pct: u32,
 }
 
 impl Default for Settings {
@@ -63,6 +75,7 @@ impl Default for Settings {
             hidden_addresses: Vec::new(),
             known_devices: Vec::new(),
             strip_side: "right".into(),
+            text_pct: DEFAULT_TEXT_PCT,
         }
     }
 }
@@ -88,16 +101,32 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        if let Some(dir) = Self::path().parent() {
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::path(), text);
+        let Ok(text) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        // 原子写：先写同目录临时文件，再 rename 覆盖。
+        // 直接 fs::write 到目标文件时，崩溃/断电会留下半截 JSON，而 load() 解析失败
+        // 会静默回退默认值 —— 用户设置会被无声清空，所以这里必须避免半截文件。
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            // Windows 上 std::fs::rename 使用 MOVEFILE_REPLACE_EXISTING，可覆盖已存在的目标
+            if std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 
     pub fn poll_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.poll_seconds.clamp(10, 3600))
+    }
+
+    /// 字号百分比，钳制到合法范围（settings.json 是用户可手改的）。
+    pub fn text_pct(&self) -> u32 {
+        self.text_pct.clamp(MIN_TEXT_PCT, MAX_TEXT_PCT)
     }
 
     pub fn dock_left(&self) -> bool {
@@ -143,8 +172,12 @@ impl Settings {
                 changed = true;
             }
         }
-        if self.known_devices.len() > 40 {
-            self.known_devices.truncate(40);
+        if self.known_devices.len() > MAX_KNOWN_DEVICES {
+            // 新设备追加在尾部：保留最新的一批，淘汰最旧的。
+            // （旧实现用 truncate(40) 保留**前** 40 条，设备满了以后刚加进来的新设备会
+            //  当场被截掉，永远记不住，而且每轮 remember() 都返回 true 反复写盘。）
+            let drop = self.known_devices.len() - MAX_KNOWN_DEVICES;
+            self.known_devices.drain(..drop);
             changed = true;
         }
         changed
@@ -285,6 +318,29 @@ mod tests {
         assert!(!rows[0].connected);
     }
 
+    /// 回归：列表满 40 后，新设备必须仍然记得住，且不会每轮都触发保存。
+    #[test]
+    fn remember_keeps_newest_device_when_full() {
+        let mut s = Settings::default();
+        for i in 0..MAX_KNOWN_DEVICES {
+            assert!(s.remember(&[dev(&format!("D{i}"), &format!("addr{i}"), true, None)]));
+        }
+        assert_eq!(s.known_devices.len(), MAX_KNOWN_DEVICES);
+        // 第 41 个设备：应被记住（淘汰最旧的 D0），且只在这一轮返回 changed
+        assert!(s.remember(&[dev("Newest", "addr-new", true, None)]));
+        assert_eq!(s.known_devices.len(), MAX_KNOWN_DEVICES);
+        assert!(
+            s.known_devices.iter().any(|k| k.address == "addr-new"),
+            "新设备必须被记住"
+        );
+        assert!(
+            !s.known_devices.iter().any(|k| k.address == "addr0"),
+            "应淘汰最旧的"
+        );
+        // 再记一次不应产生变化（旧实现会一直返回 true 反复写盘）
+        assert!(!s.remember(&[dev("Newest", "addr-new", true, None)]));
+    }
+
     #[test]
     fn settings_hides_legacy_wired_x87_address() {
         let mut s = Settings::default();
@@ -310,6 +366,24 @@ mod tests {
         assert!(!back.is_shown("hid:x"));
         assert!(!back.show_offline);
         assert_eq!(back.poll_seconds, 30);
+    }
+
+    #[test]
+    fn text_pct_defaults_and_clamps() {
+        let mut s = Settings::default();
+        assert_eq!(s.text_pct(), DEFAULT_TEXT_PCT);
+        // 手改 settings.json 也不能越界
+        s.text_pct = 5;
+        assert_eq!(s.text_pct(), MIN_TEXT_PCT);
+        s.text_pct = 9999;
+        assert_eq!(s.text_pct(), MAX_TEXT_PCT);
+        // 缺字段的旧设置文件仍能解析，并落到默认档
+        let legacy: Settings = serde_json::from_str(r#"{"poll_seconds":30}"#).unwrap();
+        assert_eq!(legacy.text_pct(), DEFAULT_TEXT_PCT);
+        // 往返
+        s.text_pct = 120;
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.text_pct(), 120);
     }
 
     #[test]

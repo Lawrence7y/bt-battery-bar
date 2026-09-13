@@ -63,6 +63,19 @@ pub fn parse_resp<'a>(buf: &'a [u8], dev: u8, feat: u8, func: u8) -> Option<&'a 
     Some(&buf[4..])
 }
 
+/// 该集合应发短帧还是长帧？None = 集合放不下 HID++ 输出报文。
+///
+/// 关键：报告长度必须与集合的 OutputReportByteLength 一致。
+/// Unifying 接收器的 HID++ 集合是 7 字节输出；Lightspeed / 有线设备常见 20 字节，
+/// 必须用长帧，否则 WriteFile 直接失败。
+fn frame_is_short(out_len: u16) -> Option<bool> {
+    if out_len < 7 {
+        None
+    } else {
+        Some(out_len < 20)
+    }
+}
+
 /// Send one request and wait for the matching response payload.
 fn transact(
     handle: HANDLE,
@@ -74,10 +87,13 @@ fn transact(
     params: &[u8],
 ) -> Option<Vec<u8>> {
     unsafe {
-        let short = out_len >= 7;
-        if !short && out_len < 20 {
-            return None; // collection cannot send HID++ output reports
-        }
+        // HID++ 帧长度必须与集合的 OutputReportByteLength 一致，否则 WriteFile 会以
+        // ERROR_INVALID_PARAMETER 失败（见 build_req 文档）：
+        //   7..20 字节的集合 -> 7 字节短帧（report id 0x10）
+        //   >= 20 字节的集合 -> 20 字节长帧（report id 0x11）
+        // 曾经写成 `short = out_len >= 7`，于是 20 字节的 Lightspeed 集合被塞 7 字节
+        // 短帧，这类设备的 HID++ 电量永远查不到。
+        let short = frame_is_short(out_len)?;
         let req = build_req(short, dev, feat, func, params);
         overlapped_write(handle, &req).ok()?;
 
@@ -211,5 +227,20 @@ mod tests {
     #[test]
     fn parse_resp_rejects_short_frames() {
         assert!(parse_resp(&[0x10, 0xFF, 0x00], 0xFF, 0x00, 0x00).is_none());
+    }
+
+    #[test]
+    fn frame_length_matches_collection_report_size() {
+        // Unifying 接收器（7 字节输出）走短帧
+        assert_eq!(frame_is_short(7), Some(true));
+        // 放不下输出报文的集合
+        assert_eq!(frame_is_short(0), None);
+        assert_eq!(frame_is_short(6), None);
+        // Lightspeed / 有线设备的 20 字节集合必须用长帧（回归：旧代码发 7 字节短帧）
+        assert_eq!(frame_is_short(20), Some(false));
+        assert_eq!(frame_is_short(33), Some(false));
+        let long = build_req(frame_is_short(20).unwrap(), 0xFF, 0x00, 0x00, &[0x10, 0x02]);
+        assert_eq!(long.len(), 20);
+        assert_eq!(long[0], 0x11);
     }
 }

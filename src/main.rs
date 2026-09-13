@@ -8,6 +8,10 @@
 //!   bt-battery-bar hidlisten [秒]         持续监听 2.4G 厂商报告（调试）
 //!   bt-battery-bar battprops              检查 Windows 是否暴露设备电量属性（调试）
 
+// GUI 子系统：正常启动（无参数）不创建/不显示控制台窗口。
+// 调试子命令从终端调用时由 main() 里的 attach_parent_console 重新附着控制台输出。
+#![windows_subsystem = "windows"]
+
 mod app;
 mod btreader;
 mod dblog;
@@ -20,22 +24,12 @@ mod settings;
 mod theme;
 
 fn main() {
-    // 单实例保护：重复启动（开机自启 + 手动双击）直接退出。
-    // 内核互斥体句柄不关闭也无需保活：进程存活期间对象一直存在，
-    // 进程退出时由系统统一回收。
-    unsafe {
-        use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-        use windows::Win32::System::Threading::CreateMutexW;
-        use windows::core::PCWSTR;
-        let name: Vec<u16> = "BtBatteryBarSingleInstance\0".encode_utf16().collect();
-        if CreateMutexW(None, false, PCWSTR(name.as_ptr())).is_ok()
-            && GetLastError() == ERROR_ALREADY_EXISTS
-        {
-            return;
-        }
-    }
-
     let args: Vec<String> = std::env::args().skip(1).collect();
+    attach_parent_console(&args);
+
+    // 调试子命令先于单实例检查：它们是只读诊断，必须在应用已在运行时也能用。
+    // （旧顺序把互斥体检查放在最前面，导致应用在跑时 `probe` / `hidprobe` / … 静默退出，
+    //  既不输出也不报错，看起来像"命令没反应"。）
     if args
         .iter()
         .any(|a| a == "probe" || a == "--probe" || a == "-p")
@@ -135,6 +129,13 @@ fn main() {
         return;
     }
 
+    // ---- GUI 启动路径：单实例保护 ----
+    // 重复启动（开机自启 + 手动双击）直接退出，但给出可见提示，不再静默。
+    if single_instance_taken() {
+        println!("BtBatteryBar 已在运行，本次启动已忽略。");
+        return;
+    }
+
     let app = app::App::new();
     if args.iter().any(|a| a == "demo" || a == "--demo") {
         app.enable_demo_data();
@@ -144,6 +145,20 @@ fn main() {
     std::process::exit(code);
 }
 
+/// true = 已有实例在运行（互斥体已存在）。
+/// 内核互斥体句柄**故意不关闭**：进程存活期间对象一直存在，进程退出时由系统回收；
+/// windows-core 0.58 的 `HANDLE` 没有 Drop，因此这里丢弃返回值不会释放互斥体。
+fn single_instance_taken() -> bool {
+    unsafe {
+        use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::core::PCWSTR;
+        let name: Vec<u16> = "BtBatteryBarSingleInstance\0".encode_utf16().collect();
+        CreateMutexW(None, false, PCWSTR(name.as_ptr())).is_ok()
+            && GetLastError() == ERROR_ALREADY_EXISTS
+    }
+}
+
 fn dump_battery_props() {
     println!("=== Bluetooth GATT ===");
     let bt = btreader::enumerate();
@@ -151,4 +166,16 @@ fn dump_battery_props() {
     println!("=== HID / 2.4G ===");
     let hid = hid::enumerate_devices();
     println!("{}", serde_json::to_string_pretty(&hid).unwrap());
+}
+
+/// GUI 子系统进程默认没有控制台；带参数（调试子命令）从终端启动时
+/// 重新附着父进程控制台，使 println!/JSON 输出可见。正常无参启动不附着。
+fn attach_parent_console(args: &[String]) {
+    if args.is_empty() {
+        return;
+    }
+    unsafe {
+        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }

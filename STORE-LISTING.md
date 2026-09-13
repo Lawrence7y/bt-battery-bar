@@ -14,7 +14,7 @@ BtBatteryBar is a lightweight Windows utility that embeds a mini battery bar dir
 - **Truly embedded in the taskbar** — sits next to the clock as a native part of the taskbar (not a floating overlay), automatically follows taskbar position/size/DPI, and survives Explorer restarts.
 - **Broad device support** — reads the standard Bluetooth GATT Battery Service (0x180F), Logitech HID++ (Unifying/Lightspeed/receivers/wired), plus common 2.4G dongle protocols (Compx/ATK/Sonix & more) via plain system APIs. No extra drivers needed.
 - **Fast & event-driven** — connect/disconnect detected within ~1–2 seconds via system events; devices that support push notifications update instantly through GATT Notify.
-- **Feather-light** — single ~0.4 MB native executable, no runtime, no Electron, no WebView; idles around 10–12 MB of RAM.
+- **Feather-light** — single ~0.4 MB native executable, no Electron, no WebView; idles around 10–12 MB of RAM.
 - **Color-coded at a glance** — green ≥50%, orange 20–49%, red <20%, with tray bubble alerts when a device drops to 20%.
 - **Overflow panel** — too many devices? A "+n" pill opens the full list so nothing is ever cut off.
 - **Full-screen friendly** — when embedded it never covers your games or videos; even in fallback floating mode it auto-hides during full-screen apps.
@@ -45,7 +45,7 @@ Initial release on Microsoft Store.
 7. Adjustable polling interval: 30 s / 1 min / 5 min
 8. Overflow "+n" panel when many devices are connected
 9. Survives Explorer restarts with automatic re-embedding
-10. Extremely lightweight: ~0.4 MB binary, ~10 MB RAM, no dependencies
+10. Extremely lightweight: ~0.4 MB binary, ~10 MB RAM
 11. Autostart with Windows
 12. Dark & light theme aware
 13. Demo mode to preview the UI (`bt-battery-bar.exe demo`)
@@ -121,12 +121,31 @@ BtBatteryBar 是一款轻量级 Windows 工具，它在任务栏内部嵌入一�
 |---|---|---|
 | 屏幕截图 | `msix/store/screenshot-1.png` | 1920×1080 |
 | 屏幕截图（特写） | `msix/store/screenshot-2.png` | 1920×1080 |
+| Xbox 品牌关键艺术 | `msix/store/branded-key-art-584x800.png` | 584×800（含标题和品牌栏） |
+| Xbox 标题主视觉 | `msix/store/xbox-titled-hero-1920x1080.png` | 1920×1080（含标题） |
 | 9:16 招贴画 | `msix/store/poster-9x16.png` | 720×1080 |
+| 720×1080 直观命名副本 | `msix/store/720x1080.png` | 720×1080 |
 | 1:1 酷图 | `msix/store/boxart-1x1.png` | 1080×1080 |
+| Xbox 特色促销方形图 | `msix/store/featured-promo-square-1080x1080.png` | 1080×1080（不含产品名） |
 | 16:9 主角图像 | `msix/store/hero-16x9.png` | 1920×1080（不含产品名）|
 | 1:1 应用磁贴图标 | `msix/store/tile-icon-300x300.png` | 300×300 |
 | 1:1 | `msix/store/tile-150x150.png` | 150×150 |
 | 1:1 | `msix/store/tile-71x71.png` | 71×71 |
 
+应用包图标由 `tools/make_icon.py` 统一生成，包含 `AppList.targetsize-*` 的深色/浅色无底板资源、
+`Square44x44Logo`、`Square150x150Logo` 和 `StoreLogo` 的倍率资源，以及 Windows 磁贴资源。
+
 截图为真实程序渲染（demo 数据）：先运行 `release\bt-battery-bar.exe demo`，
 再运行 `python tools\make_store_assets.py` 即可重新生成全部图片。
+
+---
+
+## 提交审核备注（Notes for certification）
+
+在 Partner Center 重新提交审核时，可以在 **Notes for certification** 栏中填写以下说明以加快审核：
+
+```text
+This update addresses the certification feedback:
+1. Policy 10.1.1.11 (On Device Tiles): All tile, logo, and visual assets are 100% original artwork created by our team (original battery silhouette + pulse waveform), with no third-party trademarks, Bluetooth SIG logos, or proprietary symbols.
+2. Policy 10.2.4.1 (Software Dependencies): the executable links the C runtime statically (`+crt-static` via `.cargo/config.toml`, now tracked), so there is no VC++ runtime dependency to disclose. `tools/pack-msix.ps1` fails the build if that ever regresses.
+```

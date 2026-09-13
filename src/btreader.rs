@@ -111,10 +111,11 @@ pub fn enumerate() -> Vec<Device> {
     let mut out: Vec<Device> = Vec::new();
 
     // ---- collect the paired-device lists (fast, cached by the system) ----
+    // 走 op_result：这些 WinRT 异步调用同样必须有硬超时，否则蓝牙栈卡死时
+    // 整个轮询线程会永久阻塞在 .get() 上（与模块头声明的设计相矛盾）。
     let mut le_infos = Vec::new();
     if let Ok(selector) = BluetoothLEDevice::GetDeviceSelectorFromPairingState(true)
-        && let Ok(collection) =
-            DeviceInformation::FindAllAsyncAqsFilter(&selector).and_then(|op| op.get())
+        && let Some(collection) = op_result(DeviceInformation::FindAllAsyncAqsFilter(&selector))
     {
         let size = collection.Size().unwrap_or(0);
         for i in 0..size {
@@ -125,8 +126,7 @@ pub fn enumerate() -> Vec<Device> {
     }
     let mut classic_infos = Vec::new();
     if let Ok(selector) = BluetoothDevice::GetDeviceSelectorFromPairingState(true)
-        && let Ok(collection) =
-            DeviceInformation::FindAllAsyncAqsFilter(&selector).and_then(|op| op.get())
+        && let Some(collection) = op_result(DeviceInformation::FindAllAsyncAqsFilter(&selector))
     {
         let size = collection.Size().unwrap_or(0);
         for i in 0..size {

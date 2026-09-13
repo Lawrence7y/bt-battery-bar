@@ -115,7 +115,17 @@ namespace BtBatteryBarSetup
                 Report(92, "正在启动 bt-battery-bar…");
                 try
                 {
-                    Process.Start(Path.Combine(DestDir, "bt-battery-bar.exe"));
+                    // 仅启动安装器自行释放、文件名为固定白名单的主程序
+                    string mainExe = Path.Combine(DestDir, "bt-battery-bar.exe");
+                    if (string.Equals(Path.GetFileName(mainExe), "bt-battery-bar.exe", StringComparison.OrdinalIgnoreCase)
+                        && File.Exists(mainExe))
+                    {
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = mainExe,
+                            UseShellExecute = false
+                        });
+                    }
                 }
                 catch { }
             }
@@ -173,7 +183,7 @@ namespace BtBatteryBarSetup
             using (RegistryKey key = Registry.CurrentUser.CreateSubKey(un))
             {
                 key.SetValue("DisplayName", "bt-battery-bar（任务栏蓝牙/2.4G 电量条）");
-                key.SetValue("DisplayVersion", "0.1.0");
+                key.SetValue("DisplayVersion", "0.1.3");
                 key.SetValue("Publisher", "bt-battery-bar");
                 key.SetValue("InstallLocation", DestDir);
                 key.SetValue("DisplayIcon", Path.Combine(DestDir, "bt-battery-bar.exe"));

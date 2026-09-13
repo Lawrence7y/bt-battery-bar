@@ -2,7 +2,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,8 +14,8 @@ use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-    EndPaint, FillRect, GetDC, GetDIBits, GetMonitorInfoW, GetTextExtentPoint32W, HBRUSH, HDC,
-    HFONT, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    Ellipse, EndPaint, FillRect, GetDC, GetDIBits, GetMonitorInfoW, GetTextExtentPoint32W, HBRUSH,
+    HDC, HFONT, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
     PAINTSTRUCT, ROP_CODE, ReleaseDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
     TRANSPARENT, TextOutW,
 };
@@ -28,7 +28,7 @@ use windows::Win32::System::Registry::{
     RegSetValueExW,
 };
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, GetRawInputDeviceInfoW, HRAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
@@ -52,9 +52,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetLayeredWindowAttributes, SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, TPM_RETURNCMD, TPM_RIGHTBUTTON, TRACK_POPUP_MENU_FLAGS, TrackPopupMenu,
     TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DEVICECHANGE,
-    WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_INPUT, WM_KILLFOCUS, WM_LBUTTONUP, WM_NULL, WM_PAINT,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_INPUT, WM_KILLFOCUS,
+    WM_LBUTTONUP, WM_NULL, WM_PAINT, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+    WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -63,7 +64,7 @@ use crate::hid;
 use crate::hidwatch;
 use crate::icon;
 use crate::model::{Device, Snapshot};
-use crate::settings::Settings;
+use crate::settings::{MAX_TEXT_PCT, MIN_TEXT_PCT, Settings};
 use crate::theme::{self, rgb};
 
 #[link(name = "user32")]
@@ -122,8 +123,64 @@ const MID_LOW20: usize = 1014;
 const MID_LOW30: usize = 1015;
 const MID_BT_ADD: usize = 1016;
 const MID_BT_DEVICES: usize = 1017;
+const MID_FONT_S: usize = 1020;
+const MID_FONT_M: usize = 1021;
+const MID_FONT_L: usize = 1022;
+const MID_FONT_XL: usize = 1023;
 const MID_DEV_BASE: usize = 3100;
+
+/// 字号档位：菜单 id -> 百分比。
+const FONT_PRESETS: [(usize, u32); 4] = [
+    (MID_FONT_S, 80),
+    (MID_FONT_M, 100),
+    (MID_FONT_L, 120),
+    (MID_FONT_XL, 140),
+];
 const MAX_MENU_DEVICES: usize = 16;
+
+// ---------------------------------------------------------------------------
+/// 96 DPI（100% 缩放）下的设计值 -> 当前 DPI 的物理像素。
+///
+/// 这些常量原来是"裸像素"，但条的高度取自真实任务栏（150% 缩放时是 72px），
+/// 结果就是「72px 高的任务栏里画 16px 小字」。所有几何量都要经 `Metrics::sc()`
+/// 换算，字体高度同理（见 `App::recreate_fonts`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Metrics {
+    dpi: i32,
+    /// 用户字号百分比（100 = 设计值），菜单"字号"可调。
+    text_pct: i32,
+}
+
+impl Metrics {
+    /// 仅测试使用：生产路径一律带用户字号档（`with_text_pct`）。
+    #[cfg(test)]
+    fn new(dpi: i32) -> Self {
+        Self::with_text_pct(dpi, 100)
+    }
+    fn with_text_pct(dpi: i32, text_pct: u32) -> Self {
+        Self {
+            dpi: if dpi <= 0 { 96 } else { dpi },
+            text_pct: text_pct.clamp(MIN_TEXT_PCT, MAX_TEXT_PCT) as i32,
+        }
+    }
+    /// 只按 96 DPI 基准缩放：用于与字号无关的几何量（浮动条高度、任务栏预留、
+    /// 与托盘的间隙等）。
+    fn sc(&self, v: i32) -> i32 {
+        (v * self.dpi + 48) / 96
+    }
+    /// DPI × 用户字号百分比：用于字体、圆点、间距、内边距、面板行高等
+    /// —— 让整套排版随字号一起缩放，而不是只把字改大改小。
+    fn st(&self, v: i32) -> i32 {
+        let d = self.sc(v) * self.text_pct;
+        (d + 50) / 100
+    }
+}
+
+const BASE_DPI: i32 = 96;
+// 设计值（96 DPI 下的像素高）。16 在 150% 缩放下是 24px，用户反馈偏大，
+// 降到 13（150% 下 19.5px），并交给"字号"档位继续微调。
+const NAME_FONT_PT: i32 = 13;
+const PILL_FONT_PT: i32 = 12;
 
 // ---------------------------------------------------------------------------
 pub struct App {
@@ -168,6 +225,13 @@ pub struct App {
     recreate_attempts: AtomicU32,
     /// Last placement we applied via SetWindowPos, to detect re-anchor needs.
     last_place: Mutex<StripPlace>,
+    /// 当前窗口 DPI（0 = 尚未探测，按 96 处理）。用于把所有几何常量换算成物理像素。
+    dpi: AtomicI32,
+    /// 上一次 SetParent 失败的错误码（0 = 上次成功）；用于抑制每秒重复写日志。
+    embed_fail_logged: AtomicU32,
+    /// 缓存 settings.text_pct：metrics() 会被已在持锁路径上调用，不能再锁 settings
+    /// （std Mutex 不可重入，会死锁）。
+    text_pct: AtomicI32,
 }
 
 /// Where the strip window currently sits, in whichever coordinate space is
@@ -222,6 +286,7 @@ pub static APP: std::sync::OnceLock<Arc<App>> = std::sync::OnceLock::new();
 impl App {
     pub fn new() -> Arc<Self> {
         let cfg = Settings::load();
+        let cfg_text_pct = cfg.text_pct() as i32;
         Arc::new(App {
             hwnd: AtomicI64::new(0),
             raw_hwnd: AtomicI64::new(0),
@@ -252,7 +317,49 @@ impl App {
             recreating: AtomicBool::new(false),
             recreate_attempts: AtomicU32::new(0),
             last_place: Mutex::new(StripPlace::default()),
+            dpi: AtomicI32::new(BASE_DPI),
+            embed_fail_logged: AtomicU32::new(0),
+            text_pct: AtomicI32::new(cfg_text_pct),
         })
+    }
+
+    /// 当前几何/字号缩放基准。
+    fn metrics(&self) -> Metrics {
+        Metrics::with_text_pct(
+            self.dpi.load(Ordering::Relaxed),
+            self.text_pct.load(Ordering::Relaxed).max(0) as u32,
+        )
+    }
+
+    /// 重新探测窗口 DPI；返回是否发生变化。
+    fn refresh_dpi(&self, hwnd: HWND) -> bool {
+        let dpi = unsafe { GetDpiForWindow(hwnd) } as i32;
+        let dpi = if dpi <= 0 { BASE_DPI } else { dpi };
+        let old = self.dpi.swap(dpi, Ordering::Relaxed);
+        old != dpi
+    }
+
+    /// 按当前 DPI × 字号档创建（或重建）字体；重建前先删旧字体，避免 GDI 句柄泄漏。
+    fn recreate_fonts(&self) {
+        let m = self.metrics();
+        let old_name = self.name_font.swap(0, Ordering::Relaxed);
+        let old_pill = self.pill_font.swap(0, Ordering::Relaxed);
+        unsafe {
+            if old_name != 0 {
+                let _ = DeleteObject(HGDIOBJ(old_name as _));
+            }
+            if old_pill != 0 {
+                let _ = DeleteObject(HGDIOBJ(old_pill as _));
+            }
+        }
+        self.name_font.store(
+            create_font(-m.st(NAME_FONT_PT), 600).0 as i64,
+            Ordering::Relaxed,
+        );
+        self.pill_font.store(
+            create_font(-m.st(PILL_FONT_PT), 700).0 as i64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Fill snapshot with demo devices (visual preview / testing).
@@ -491,7 +598,10 @@ impl App {
     pub fn run(self: &Arc<Self>) -> i32 {
         unsafe {
             crate::dblog::log("run: start");
-            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+            // Per-monitor-v2：混合 DPI 多屏下 GetDpiForWindow 会给出**每块屏**的
+            // DPI，配合 WM_DPICHANGED 重建字体。SYSTEM_AWARE 时全进程只有一个 DPI，
+            // 条挂到 100% 屏的任务栏（48px）上时字会按 150% 画成 36px，明显挤爆。
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
             let class_name = w!("BtBatteryBarStrip");
@@ -539,10 +649,10 @@ impl App {
             self.hwnd.store(hwnd.0 as i64, Ordering::Relaxed);
             let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, self.as_ref() as *const App as isize);
 
-            self.name_font
-                .store(create_font(-16, 600).0 as i64, Ordering::Relaxed);
-            self.pill_font
-                .store(create_font(-15, 700).0 as i64, Ordering::Relaxed);
+            // 读窗口 DPI 再建字体：150% 缩放下字体必须是 16*1.5 = 24px，
+            // 否则条里会是"大任务栏 + 小字"。
+            self.refresh_dpi(hwnd);
+            self.recreate_fonts();
 
             // Broadcast sent by Explorer whenever the taskbar is (re)created.
             let tbc = RegisterWindowMessageW(w!("TaskbarCreated"));
@@ -740,6 +850,27 @@ impl App {
                 MF_BYCOMMAND.0,
             );
             append_popup(m_display, m_pos, w!("位置"));
+
+            let Ok(m_font) = CreatePopupMenu() else {
+                return;
+            };
+            let cur_pct = self.text_pct.load(Ordering::Relaxed).max(0) as u32;
+            let mut font_id = MID_FONT_M;
+            for (id, pct) in FONT_PRESETS {
+                append_item(m_font, id, preset_label(pct), cur_pct == pct);
+                if cur_pct == pct {
+                    font_id = id;
+                }
+            }
+            let _ = CheckMenuRadioItem(
+                m_font,
+                MID_FONT_S as u32,
+                MID_FONT_XL as u32,
+                font_id as u32,
+                MF_BYCOMMAND.0,
+            );
+            append_popup(m_display, m_font, w!("字号"));
+
             append_popup(root, m_display, w!("显示"));
 
             append_item(root, MID_REFRESH, w!("立即刷新"), false);
@@ -866,6 +997,23 @@ impl App {
                 self.mark_dirty();
             }
             MID_REFRESH => self.request_refresh(),
+            id if FONT_PRESETS.iter().any(|(pid, _)| *pid == id) => {
+                let pct = FONT_PRESETS
+                    .iter()
+                    .find(|(pid, _)| *pid == id)
+                    .map(|(_, pct)| *pct)
+                    .unwrap_or(crate::settings::DEFAULT_TEXT_PCT);
+                {
+                    let mut cfg = self.settings.lock().unwrap();
+                    cfg.text_pct = pct;
+                    cfg.save();
+                }
+                self.text_pct.store(pct as i32, Ordering::Relaxed);
+                // 字号决定字体，也决定圆点/间距/胶囊宽高，因此必须重建字体并重排。
+                self.recreate_fonts();
+                self.mark_dirty();
+                self.layout_and_resize();
+            }
             MID_INT10 | MID_INT30 | MID_INT60 | MID_INT300 => {
                 let v = if id == MID_INT10 {
                     10
@@ -1041,6 +1189,7 @@ impl App {
                 // An embedded strip can't cover fullscreen apps; clear any
                 // stale auto-hide from a previous degraded session.
                 self.fs_hidden.store(false, Ordering::Relaxed);
+                self.embed_fail_logged.store(0, Ordering::Relaxed);
                 crate::dblog::log("taskbar: embedded into Shell_TrayWnd (WS_CHILD + SetParent)");
                 // Visibility is decided by layout_and_resize() via
                 // strip_visibility() — a user-hidden strip stays hidden.
@@ -1048,9 +1197,14 @@ impl App {
                 true
             }
             Err(e) => {
-                crate::dblog::log(&format!(
-                    "taskbar: SetParent failed ({e}); degrading to floating non-topmost bar"
-                ));
+                // heal_embedding 每秒都会重试，因此这里只在**首次失败 / 错误变化**时
+                // 记录：真机日志里这一行曾以每秒一条的速度刷了 60+ 次。
+                let code = e.code().0 as u32;
+                if self.embed_fail_logged.swap(code, Ordering::Relaxed) != code {
+                    crate::dblog::log(&format!(
+                        "taskbar: SetParent failed ({e}); degrading to floating non-topmost bar"
+                    ));
+                }
                 // Restore popup style so the fallback behaves like before.
                 SetWindowLongPtrW(
                     hwnd,
@@ -1249,45 +1403,43 @@ impl App {
 
     /// Compute where the strip should be right now.
     /// - embedded: pure math against the taskbar's own client rect
-    /// - degraded with a taskbar: overlay it in SCREEN coords (non-topmost)
-    /// - no taskbar at all: dock to the work area bottom
+    /// - degraded (SetParent failed / no taskbar): dock to the work-area edge
+    ///
+    /// 降级时**不再**把浮动条盖在任务栏矩形上：任务栏是 WS_EX_TOPMOST，而本窗口
+    /// 刻意从不置顶（见 `apply_topmost`），盖上去只会被任务栏挡住 = 用户看不到条
+    /// （真机日志里 SetParent 失败 64 次，正是这条路径）。改为贴工作区边缘：
+    /// 可见、不置顶、不挡全屏窗口，且现有的全屏自动隐藏照常生效。
     fn desired_placement(&self, width: i32) -> StripPlace {
         let dock_left = self.settings.lock().unwrap().dock_left();
+        let m = self.metrics();
         if self.embedded.load(Ordering::Relaxed) {
             if let Some((tb_client, tray_left)) = taskbar_client_geometry() {
                 let (x, y, w, h) =
-                    strip_placement_in_taskbar(tb_client, tray_left, dock_left, width);
+                    strip_placement_in_taskbar(tb_client, tray_left, dock_left, width, &m);
                 return StripPlace { x, y, w, h };
             }
             // Geometry hiccup while flagged embedded: stay put this tick.
             return *self.last_place.lock().unwrap();
         }
         unsafe {
-            match find_taskbar() {
-                Some((_shell, tb, tray_left)) => {
-                    let (x, y, h) = strip_placement_on_screen(tb, tray_left, dock_left, width);
-                    StripPlace { x, y, w: width, h }
-                }
-                None => {
-                    let mut wa = RECT::default();
-                    let _ = SystemParametersInfoW(
-                        SPI_GETWORKAREA,
-                        0,
-                        Some(&mut wa as *mut _ as *mut _),
-                        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-                    );
-                    let x = if dock_left {
-                        wa.left + LEFT_INSET
-                    } else {
-                        wa.right - width - 6
-                    };
-                    StripPlace {
-                        x,
-                        y: wa.bottom - STRIP_HEIGHT - 6,
-                        w: width,
-                        h: STRIP_HEIGHT,
-                    }
-                }
+            let mut wa = RECT::default();
+            let _ = SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut wa as *mut _ as *mut _),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+            let strip_h = m.sc(STRIP_HEIGHT);
+            let x = if dock_left {
+                wa.left + m.sc(LEFT_INSET)
+            } else {
+                wa.right - width - m.sc(6)
+            };
+            StripPlace {
+                x,
+                y: wa.bottom - strip_h - m.sc(6),
+                w: width,
+                h: strip_h,
             }
         }
     }
@@ -1297,9 +1449,12 @@ impl App {
     /// opens the full-device popup panel.
     fn compute_layout(&self) -> StripLayout {
         unsafe {
+            let m = self.metrics();
             let dc = GetDC(HWND::default());
             let all = self.visible_devices();
-            let max_w = max_strip_width();
+            // 工作区读失败时 max_strip_width() 会是 0，.min(0) 会做出 0 像素宽的窗口；
+            // 至少留一个最小条宽。
+            let max_w = max_strip_width().max(m.st(MIN_STRIP_WIDTH));
             let mut chosen: Vec<Device> = Vec::new();
             let mut w = 0i32;
             let mut overflow = 0usize;
@@ -1310,17 +1465,21 @@ impl App {
                 let oldp = SelectObject(dc, HGDIOBJ(self.pill_font().0));
                 let (pw, _) = text_size(dc, &pill_text(&d));
                 let _ = SelectObject(dc, oldp);
-                let item_w = if i == 0 { 0 } else { DEV_GAP }
-                    + DOT
-                    + DOT_GAP
+                let item_w = if i == 0 { 0 } else { m.st(DEV_GAP) }
+                    + m.st(DOT)
+                    + m.st(DOT_GAP)
                     + tw
-                    + NAME_PILL_GAP
+                    + m.st(NAME_PILL_GAP)
                     + pw
-                    + PILL_PAD * 2;
+                    + m.st(PILL_PAD) * 2;
                 let more_after = all.len() - i > 1;
                 // Reserve room for the "+n" pill whenever something might be cut.
-                let reserve = if more_after { OVERFLOW_PILL_MIN } else { 0 };
-                if w + item_w + reserve > max_w - MARGIN_X * 2 {
+                let reserve = if more_after {
+                    m.st(OVERFLOW_PILL_MIN)
+                } else {
+                    0
+                };
+                if w + item_w + reserve > max_w - m.st(MARGIN_X) * 2 {
                     overflow = all.len() - i;
                     break;
                 }
@@ -1328,13 +1487,13 @@ impl App {
                 chosen.push(d.clone());
             }
             if overflow > 0 {
-                w += DEV_GAP + OVERFLOW_PILL_MIN;
+                w += m.st(DEV_GAP) + m.st(OVERFLOW_PILL_MIN);
             }
             let _ = ReleaseDC(HWND::default(), dc);
             StripLayout {
                 devices: chosen,
                 overflow,
-                width: (w + MARGIN_X * 2).max(80).min(max_w),
+                width: (w + m.st(MARGIN_X) * 2).max(m.st(80)).min(max_w),
             }
         }
     }
@@ -1388,13 +1547,17 @@ impl App {
             let devices = &layout.devices;
             let low_alert = self.settings.lock().unwrap().low_battery_alert;
             let cy = (rc.bottom - rc.top) / 2;
+            let m = self.metrics();
+            // 每次重画都先清掉上一条的 "+n" 热区：否则溢出消失后旧热区仍在，
+            // 点到条上会莫名其妙弹出设备面板（而不是"立即刷新"）。
+            *self.overflow_x.lock().unwrap() = (0, 0);
 
             if devices.is_empty() {
                 let old = SelectObject(md, HGDIOBJ(self.name_font().0));
                 let (_, th) = text_size(md, "暂无设备");
                 draw_text_halo(
                     md,
-                    MARGIN_X,
+                    m.st(MARGIN_X),
                     cy - th / 2,
                     "暂无设备",
                     theme.fg,
@@ -1402,9 +1565,9 @@ impl App {
                 );
                 let _ = SelectObject(md, old);
             } else {
-                let mut cx = MARGIN_X;
+                let mut cx = m.st(MARGIN_X);
                 for (i, d) in devices.iter().enumerate() {
-                    cx += if i == 0 { 0 } else { DEV_GAP };
+                    cx += if i == 0 { 0 } else { m.st(DEV_GAP) };
 
                     let dcol = if !d.connected {
                         theme.dot_off
@@ -1413,22 +1576,15 @@ impl App {
                     } else {
                         theme.dot_ok
                     };
-                    let dbr = CreateSolidBrush(COLORREF(dcol));
-                    let drect = RECT {
-                        left: cx,
-                        top: cy - DOT / 2,
-                        right: cx + DOT,
-                        bottom: cy + DOT / 2 + 1,
-                    };
-                    let _ = FillRect(md, &drect, dbr);
-                    let _ = DeleteObject(HGDIOBJ(dbr.0));
-                    cx += DOT + DOT_GAP;
+                    let dot = m.st(DOT);
+                    draw_status_dot(md, cx, cy, dot, dcol);
+                    cx += dot + m.st(DOT_GAP);
 
                     let old = SelectObject(md, HGDIOBJ(self.name_font().0));
                     let (tw, th) = text_size(md, &d.name);
                     draw_text_halo(md, cx, cy - th / 2, &d.name, theme.fg, theme.fg_outline);
                     let _ = SelectObject(md, old);
-                    cx += tw + NAME_PILL_GAP;
+                    cx += tw + m.st(NAME_PILL_GAP);
 
                     let (pcolor, pfg) = match d.battery {
                         Some(v) if v <= low_alert => (theme.pill_low, rgb(255, 255, 255)),
@@ -1439,47 +1595,42 @@ impl App {
                     let ptext = pill_text(&d);
                     let old2 = SelectObject(md, HGDIOBJ(self.pill_font().0));
                     let (pw, ph) = text_size(md, &ptext);
+                    let pad = m.st(PILL_PAD);
                     let pbr = CreateSolidBrush(COLORREF(pcolor));
                     let prect = RECT {
                         left: cx,
-                        top: cy - ph / 2 - 2,
-                        right: cx + pw + PILL_PAD * 2,
-                        bottom: cy + ph / 2 + 2,
+                        top: cy - ph / 2 - m.st(2),
+                        right: cx + pw + pad * 2,
+                        bottom: cy + ph / 2 + m.st(2),
                     };
                     let _ = FillRect(md, &prect, pbr);
                     let _ = DeleteObject(HGDIOBJ(pbr.0));
-                    draw_text_halo(
-                        md,
-                        cx + PILL_PAD,
-                        cy - ph / 2,
-                        &ptext,
-                        pfg,
-                        theme.fg_outline,
-                    );
+                    draw_text_halo(md, cx + pad, cy - ph / 2, &ptext, pfg, theme.fg_outline);
                     let _ = SelectObject(md, old2);
-                    cx += pw + PILL_PAD * 2;
+                    cx += pw + pad * 2;
                 }
 
                 // "+n" pill: remaining devices that did not fit. Clicking it
                 // opens the full-device popup panel.
                 if layout.overflow > 0 {
-                    cx += DEV_GAP;
+                    cx += m.st(DEV_GAP);
                     let text = format!("+{}", layout.overflow);
                     let old3 = SelectObject(md, HGDIOBJ(self.pill_font().0));
                     let (pw, ph) = text_size(md, &text);
-                    let pill_w = pw + PILL_PAD * 2;
+                    let pad = m.st(PILL_PAD);
+                    let pill_w = pw + pad * 2;
                     let pbr = CreateSolidBrush(COLORREF(theme.pill_off_bg));
                     let prect = RECT {
                         left: cx,
-                        top: cy - ph / 2 - 2,
+                        top: cy - ph / 2 - m.st(2),
                         right: cx + pill_w,
-                        bottom: cy + ph / 2 + 2,
+                        bottom: cy + ph / 2 + m.st(2),
                     };
                     let _ = FillRect(md, &prect, pbr);
                     let _ = DeleteObject(HGDIOBJ(pbr.0));
                     draw_text_halo(
                         md,
-                        cx + PILL_PAD,
+                        cx + pad,
                         cy - ph / 2,
                         &text,
                         rgb(255, 255, 255),
@@ -1660,9 +1811,10 @@ impl App {
                 SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
             );
             let x = (sr.right - w - 2).max(wa.left + 4);
-            let mut y = sr.top - h - GAP_TRAY;
+            let gap = self.metrics().sc(GAP_TRAY);
+            let mut y = sr.top - h - gap;
             if y < wa.top {
-                y = (sr.bottom + GAP_TRAY).min(wa.bottom - h - 4);
+                y = (sr.bottom + gap).min(wa.bottom - h - 4);
             }
             let _ = SetWindowPos(
                 hwnd,
@@ -1679,9 +1831,10 @@ impl App {
 
     fn measure_panel(&self, devices: &[Device]) -> (i32, i32) {
         unsafe {
+            let m = self.metrics();
             let dc = GetDC(HWND::default());
-            let mut name_w = 60i32;
-            let mut pill_w = 40i32;
+            let mut name_w = m.st(60);
+            let mut pill_w = m.st(40);
             for d in devices {
                 let oldn = SelectObject(dc, HGDIOBJ(self.name_font().0));
                 let (tw, _) = text_size(dc, &d.name);
@@ -1690,13 +1843,30 @@ impl App {
                 let (pw, _) = text_size(dc, &pill_text(d));
                 let _ = SelectObject(dc, oldp);
                 name_w = name_w.max(tw);
-                pill_w = pill_w.max(pw + PILL_PAD * 2);
+                pill_w = pill_w.max(pw + m.st(PILL_PAD) * 2);
             }
             let _ = ReleaseDC(HWND::default(), dc);
             let rows = devices.len() as i32;
+            let mut h = rows.max(1) * m.st(PANEL_ROW_H) + m.st(PANEL_PAD) * 2;
+            // 面板是独立弹出窗口：设备多时不能高过工作区，否则顶部几行永远看不到。
+            let mut wa = RECT::default();
+            let _ = SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut wa as *mut _ as *mut _),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+            if wa.bottom > wa.top {
+                h = h.min((wa.bottom - wa.top) - m.sc(16));
+            }
             (
-                MARGIN_X + DOT + DOT_GAP + name_w + PANEL_GAP_X + pill_w + MARGIN_X * 2,
-                rows.max(1) * PANEL_ROW_H + PANEL_PAD * 2,
+                m.st(MARGIN_X) * 2
+                    + m.st(DOT)
+                    + m.st(DOT_GAP)
+                    + name_w
+                    + m.st(PANEL_GAP_X)
+                    + pill_w,
+                h,
             )
         }
     }
@@ -1729,9 +1899,10 @@ impl App {
 
             let low_alert = self.settings.lock().unwrap().low_battery_alert;
             let devices = self.panel_devices();
+            let m = self.metrics();
             for (i, d) in devices.iter().enumerate() {
-                let y = PANEL_PAD + i as i32 * PANEL_ROW_H;
-                let cy = y + PANEL_ROW_H / 2;
+                let y = m.st(PANEL_PAD) + i as i32 * m.st(PANEL_ROW_H);
+                let cy = y + m.st(PANEL_ROW_H) / 2;
                 let dcol = if !d.connected {
                     theme.dot_off
                 } else if d.battery.map(|b| b <= low_alert).unwrap_or(false) {
@@ -1739,20 +1910,13 @@ impl App {
                 } else {
                     theme.dot_ok
                 };
-                let dbr = CreateSolidBrush(COLORREF(dcol));
-                let drect = RECT {
-                    left: MARGIN_X,
-                    top: cy - DOT / 2,
-                    right: MARGIN_X + DOT,
-                    bottom: cy + DOT / 2 + 1,
-                };
-                let _ = FillRect(md, &drect, dbr);
-                let _ = DeleteObject(HGDIOBJ(dbr.0));
+                let dot = m.st(DOT);
+                draw_status_dot(md, m.st(MARGIN_X), cy, dot, dcol);
 
                 let old = SelectObject(md, HGDIOBJ(self.name_font().0));
                 draw_text_halo(
                     md,
-                    MARGIN_X + DOT + DOT_GAP,
+                    m.st(MARGIN_X) + dot + m.st(DOT_GAP),
                     cy - text_size(md, &d.name).1 / 2,
                     &d.name,
                     theme.fg,
@@ -1769,24 +1933,18 @@ impl App {
                 };
                 let old2 = SelectObject(md, HGDIOBJ(self.pill_font().0));
                 let (pw, ph) = text_size(md, &ptext);
-                let px = rc.right - MARGIN_X * 2 - pw - PILL_PAD * 2;
+                let pad = m.st(PILL_PAD);
+                let px = rc.right - m.st(MARGIN_X) * 2 - pw - pad * 2;
                 let pbr = CreateSolidBrush(COLORREF(pcolor));
                 let prect = RECT {
                     left: px,
-                    top: cy - ph / 2 - 2,
-                    right: px + pw + PILL_PAD * 2,
-                    bottom: cy + ph / 2 + 2,
+                    top: cy - ph / 2 - m.st(2),
+                    right: px + pw + pad * 2,
+                    bottom: cy + ph / 2 + m.st(2),
                 };
                 let _ = FillRect(md, &prect, pbr);
                 let _ = DeleteObject(HGDIOBJ(pbr.0));
-                draw_text_halo(
-                    md,
-                    px + PILL_PAD,
-                    cy - ph / 2,
-                    &ptext,
-                    pfg,
-                    theme.fg_outline,
-                );
+                draw_text_halo(md, px + pad, cy - ph / 2, &ptext, pfg, theme.fg_outline);
                 let _ = SelectObject(md, old2);
             }
 
@@ -1883,6 +2041,20 @@ impl App {
                 // can distinguish it from an Explorer-caused destroy.
                 self.shutting_down.store(true, Ordering::Release);
                 let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_QUERYENDSESSION => {
+                // 注销/关机：允许结束会话。
+                LRESULT(1)
+            }
+            WM_ENDSESSION => {
+                // 会话真的要结束了：趁窗口还活着主动摘掉托盘图标，
+                // 否则图标的宿主窗口消失后会残留在通知区（下一次登录才清掉）。
+                if wparam.0 != 0 {
+                    crate::dblog::log("session ending -> remove tray icon");
+                    self.shutting_down.store(true, Ordering::Release);
+                    self.remove_tray_icon();
+                }
                 LRESULT(0)
             }
             WM_PAINT => {
@@ -2004,6 +2176,16 @@ impl App {
                 self.try_recreate_strip();
                 LRESULT(0)
             }
+            WM_DEVICECHANGE => {
+                // 设备树变化只广播给顶层窗口；条嵌入任务栏后是 WS_CHILD，收不到，
+                // 所以由 helper 转成条上的去抖定时器（strip 上的同名分支继续为
+                // 降级浮动条服务）。
+                let strip = self.hwnd();
+                if !strip.0.is_null() {
+                    let _ = SetTimer(strip, DEVICE_TIMER, 400, None);
+                }
+                LRESULT(1)
+            }
             WM_TIMER if wparam.0 == RECREATE_TIMER => {
                 // Delayed recreate retry — fire once per timer, re-armed by
                 // try_recreate_strip if the attempt fails again.
@@ -2024,8 +2206,25 @@ impl App {
                         let _ = PostMessageW(hwnd, MSG_RECREATE_STRIP, WPARAM(0), LPARAM(0));
                     }
                 } else {
+                    // WM_SETTINGCHANGE 也可能是用户改了缩放比例：重读 DPI，
+                    // 变了就重建字体（否则字号会一直停在旧 DPI 上）。
+                    let strip = self.hwnd();
+                    if !strip.0.is_null() && self.refresh_dpi(strip) {
+                        crate::dblog::log("dpi changed -> recreate fonts + relayout");
+                        self.recreate_fonts();
+                    }
                     crate::dblog::log("taskbar: broadcast via helper -> heal + relayout");
                     self.heal_embedding();
+                    self.layout_and_resize();
+                }
+                LRESULT(0)
+            }
+            WM_DPICHANGED => {
+                // 系统 DPI 变化（只会送到 DPI-aware 窗口）。
+                let strip = self.hwnd();
+                if !strip.0.is_null() && self.refresh_dpi(strip) {
+                    crate::dblog::log("WM_DPICHANGED -> recreate fonts + relayout");
+                    self.recreate_fonts();
                     self.layout_and_resize();
                 }
                 LRESULT(0)
@@ -2357,50 +2556,30 @@ fn taskbar_client_geometry() -> Option<(RECT, Option<i32>)> {
 /// side and the desired width, return `(x, y, w, h)` for SetWindowPos on a
 /// WS_CHILD window. The strip docks next to the tray cluster, clamped to stay
 /// inside the taskbar no matter how narrow it is (vertical taskbars etc.).
+///
+/// 所有几何常量经 `m` 按 DPI 缩放（96 DPI 时 sc(v) == v，纯函数测试照旧）。
 fn strip_placement_in_taskbar(
     tb_client: RECT,
     tray_left_client: Option<i32>,
     dock_left: bool,
     width: i32,
+    m: &Metrics,
 ) -> (i32, i32, i32, i32) {
     let tb_w = (tb_client.right - tb_client.left).max(0);
-    let tb_h = (tb_client.bottom - tb_client.top).max(MIN_STRIP_HEIGHT);
-    let avail_w = (tb_w - 4).max(MIN_STRIP_WIDTH);
-    let w = width.clamp(MIN_STRIP_WIDTH, avail_w);
+    let tb_h = (tb_client.bottom - tb_client.top).max(m.sc(MIN_STRIP_HEIGHT));
+    let avail_w = (tb_w - m.sc(4)).max(m.st(MIN_STRIP_WIDTH));
+    let w = width.clamp(m.st(MIN_STRIP_WIDTH), avail_w);
     let right_edge = match tray_left_client {
-        Some(l) if l > tb_client.left => l - GAP_TRAY,
-        _ => tb_client.right - TASKBAR_RESERVE,
+        Some(l) if l > tb_client.left => l - m.sc(GAP_TRAY),
+        _ => tb_client.right - m.sc(TASKBAR_RESERVE),
     };
-    let max_x = (right_edge - w).max(tb_client.left + 2);
+    let max_x = (right_edge - w).max(tb_client.left + m.sc(2));
     let x = if dock_left {
-        (tb_client.left + LEFT_INSET).min(max_x)
+        (tb_client.left + m.sc(LEFT_INSET)).min(max_x)
     } else {
         max_x
     };
     (x, tb_client.top, w, tb_h)
-}
-
-/// Pure layout math for the DEGRADED floating strip: overlay the taskbar in
-/// plain SCREEN coordinates (the window stays an independent non-topmost
-/// popup). Returns `(x, y, h)`; width is used as-is.
-fn strip_placement_on_screen(
-    tb_screen: RECT,
-    tray_left_screen: Option<i32>,
-    dock_left: bool,
-    width: i32,
-) -> (i32, i32, i32) {
-    let tb_h = (tb_screen.bottom - tb_screen.top).max(MIN_STRIP_HEIGHT);
-    let right_edge = match tray_left_screen {
-        Some(l) if l > tb_screen.left => l - GAP_TRAY,
-        _ => tb_screen.right - TASKBAR_RESERVE,
-    };
-    let max_x = (right_edge - width).max(tb_screen.left + 2);
-    let x = if dock_left {
-        (tb_screen.left + LEFT_INSET).min(max_x)
-    } else {
-        max_x
-    };
-    (x, tb_screen.top, tb_h)
 }
 
 /// True when the foreground window is a genuine fullscreen window — it covers
@@ -2481,6 +2660,18 @@ fn create_font(height: i32, weight: i32) -> HFONT {
     }
 }
 
+/// 状态圆点：README 承诺的是"圆点"，所以这里画真正的圆（椭圆填充），不是方块。
+fn draw_status_dot(dc: HDC, cx: i32, cy: i32, size: i32, color: u32) {
+    let size = size.max(2);
+    unsafe {
+        let br = CreateSolidBrush(COLORREF(color));
+        let old = SelectObject(dc, HGDIOBJ(br.0));
+        let _ = Ellipse(dc, cx, cy - size / 2, cx + size, cy + size / 2 + 1);
+        let _ = SelectObject(dc, old);
+        let _ = DeleteObject(HGDIOBJ(br.0));
+    }
+}
+
 fn draw_text_halo(dc: HDC, x: i32, y: i32, s: &str, fg: u32, outline: u32) {
     unsafe {
         let mut wcs: Vec<u16> = s.encode_utf16().collect();
@@ -2540,6 +2731,16 @@ fn fill_wchars(buf: &mut [u16], s: &str, max: usize) {
 
 fn checked_flag(on: bool) -> MENU_ITEM_FLAGS {
     MENU_ITEM_FLAGS(MF_STRING.0 | if on { MF_CHECKED.0 } else { 0 })
+}
+
+/// 字号档位的菜单文案。
+fn preset_label(pct: u32) -> PCWSTR {
+    match pct {
+        80 => w!("小"),
+        100 => w!("标准"),
+        120 => w!("大"),
+        _ => w!("特大"),
+    }
 }
 
 fn append_item(menu: HMENU, id: usize, text: PCWSTR, checked: bool) {
@@ -2658,10 +2859,15 @@ fn write_bmp(path: &std::path::Path, w: u32, h: u32, bgra_top_down: &[u8]) {
 #[cfg(test)]
 mod layout_tests {
     use super::{
-        GAP_TRAY, LEFT_INSET, MIN_STRIP_HEIGHT, MIN_STRIP_WIDTH, TASKBAR_RESERVE, rect_offset_by,
-        strip_placement_in_taskbar, strip_placement_on_screen,
+        FONT_PRESETS, GAP_TRAY, LEFT_INSET, MAX_TEXT_PCT, MIN_STRIP_HEIGHT, MIN_STRIP_WIDTH,
+        MIN_TEXT_PCT, Metrics, TASKBAR_RESERVE, rect_offset_by, strip_placement_in_taskbar,
     };
     use windows::Win32::Foundation::{POINT, RECT};
+
+    /// 96 DPI（100% 缩放）：纯函数行为与改动前逐位一致。
+    fn m96() -> Metrics {
+        Metrics::new(96)
+    }
 
     fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
         RECT {
@@ -2696,7 +2902,7 @@ mod layout_tests {
     #[test]
     fn embedded_docks_right_next_to_tray() {
         let tb = rect(0, 0, 3840, 72);
-        let (x, y, w, h) = strip_placement_in_taskbar(tb, Some(3600), false, 400);
+        let (x, y, w, h) = strip_placement_in_taskbar(tb, Some(3600), false, 400, &m96());
         assert_eq!(y, 0);
         assert_eq!(h, 72);
         assert_eq!(w, 400);
@@ -2707,7 +2913,7 @@ mod layout_tests {
     #[test]
     fn embedded_docks_left_with_inset() {
         let tb = rect(0, 0, 3840, 72);
-        let (x, y, w, h) = strip_placement_in_taskbar(tb, Some(3600), true, 400);
+        let (x, y, w, h) = strip_placement_in_taskbar(tb, Some(3600), true, 400, &m96());
         assert_eq!(x, LEFT_INSET);
         assert_eq!(y, 0);
         assert_eq!(w, 400);
@@ -2717,8 +2923,8 @@ mod layout_tests {
     #[test]
     fn embedded_falls_back_to_reserve_when_tray_not_found() {
         let tb = rect(0, 0, 3840, 72);
-        let (_, _, w, _) = strip_placement_in_taskbar(tb, None, false, 400);
-        let (xr, _, _, _) = strip_placement_in_taskbar(tb, None, false, w);
+        let (_, _, w, _) = strip_placement_in_taskbar(tb, None, false, 400, &m96());
+        let (xr, _, _, _) = strip_placement_in_taskbar(tb, None, false, w, &m96());
         assert_eq!(xr + w, tb.right - TASKBAR_RESERVE);
     }
 
@@ -2728,7 +2934,7 @@ mod layout_tests {
         let tray_left = 1800;
         // Absurdly wide strip cannot fit before the tray; the math must
         // still keep it inside the taskbar bounds.
-        let (x, _, w, h) = strip_placement_in_taskbar(tb, Some(tray_left), false, 5000);
+        let (x, _, w, h) = strip_placement_in_taskbar(tb, Some(tray_left), false, 5000, &m96());
         assert_eq!(h, 48);
         assert_eq!(w, tb.right - tb.left - 4);
         assert!(x >= tb.left + 2);
@@ -2739,7 +2945,7 @@ mod layout_tests {
     fn embedded_vertical_taskbar_clamps_width_and_height() {
         // Left-docked vertical taskbar: narrow but tall.
         let tb = rect(0, 0, 80, 1080);
-        let (x, y, w, h) = strip_placement_in_taskbar(tb, Some(80), true, 600);
+        let (x, y, w, h) = strip_placement_in_taskbar(tb, Some(80), true, 600, &m96());
         assert_eq!(y, 0);
         assert_eq!(h, 1080);
         assert_eq!(w, 76); // 80 - 4
@@ -2750,32 +2956,97 @@ mod layout_tests {
     #[test]
     fn embedded_degenerate_height_gets_floor() {
         let tb = rect(0, 0, 1000, 10);
-        let (_, _, _, h) = strip_placement_in_taskbar(tb, Some(900), false, 300);
+        let (_, _, _, h) = strip_placement_in_taskbar(tb, Some(900), false, 300, &m96());
         assert_eq!(h, MIN_STRIP_HEIGHT);
-    }
-
-    #[test]
-    fn floating_overlay_matches_screen_coords_of_taskbar() {
-        let tb = rect(0, 2064, 3840, 2160);
-        let (x, y, h) = strip_placement_on_screen(tb, Some(3600), false, 400);
-        assert_eq!(y, 2064);
-        assert_eq!(h, 2160 - 2064);
-        assert_eq!(x + 400 + GAP_TRAY, 3600);
-    }
-
-    #[test]
-    fn floating_dock_left_uses_inset() {
-        let tb = rect(0, 2064, 3840, 2160);
-        let (x, y, _) = strip_placement_on_screen(tb, Some(3600), true, 400);
-        assert_eq!(x, LEFT_INSET);
-        assert_eq!(y, 2064);
     }
 
     #[test]
     fn min_width_respected_on_tiny_taskbars() {
         let tb = rect(0, 0, 20, 1080);
-        let (_, _, w, _) = strip_placement_in_taskbar(tb, None, false, 600);
+        let (_, _, w, _) = strip_placement_in_taskbar(tb, None, false, 600, &m96());
         assert_eq!(w, MIN_STRIP_WIDTH);
+    }
+
+    /// DPI 缩放：150% 下所有几何量按 1.5 放大（真机是 2560x1440@150%）。
+    #[test]
+    fn metrics_scale_all_geometry_at_150_percent() {
+        let m = Metrics::new(144);
+        assert_eq!(m.sc(6), 9); // MARGIN_X / GAP_TRAY
+        assert_eq!(m.sc(8), 12); // DOT
+        assert_eq!(m.sc(40), 60); // STRIP_HEIGHT
+        assert_eq!(m.sc(80), 120); // 最小条宽
+        assert_eq!(m.sc(MIN_STRIP_HEIGHT), 36);
+        // 退化任务栏高度下限也按 DPI 放大
+        let tb = rect(0, 0, 1000, 10);
+        let (_, _, _, h) = strip_placement_in_taskbar(tb, Some(900), false, 300, &m);
+        assert_eq!(h, 36);
+        // 与托盘的间隙同样放大：1200 - 9
+        let tb2 = rect(0, 0, 2000, 72);
+        let (x, _, w, _) = strip_placement_in_taskbar(tb2, Some(1200), false, 300, &m);
+        assert_eq!(x + w, 1191);
+    }
+
+    /// 字号档：DPI × 用户百分比（真机 150% 下：字体设计值 13 -> 19.5px）
+    #[test]
+    fn metrics_text_pct_scales_text_metrics() {
+        let base = Metrics::with_text_pct(144, 100);
+        assert_eq!(base.st(13), 20); // 150% 下字体 20px（修复前是 24px）
+        assert_eq!(base.sc(13), 20);
+        let small = Metrics::with_text_pct(144, 80);
+        assert_eq!(small.st(13), 16); // 小一档
+        assert_eq!(small.st(8), 10); // DOT 跟着缩
+        let big = Metrics::with_text_pct(144, 140);
+        assert_eq!(big.st(13), 28); // 特大
+        // 与字号无关的几何量（浮动条高度等）不受档位影响
+        assert_eq!(base.sc(40), big.sc(40));
+        assert_eq!(base.sc(40), 60);
+        // 越界档位被钳制
+        assert_eq!(
+            Metrics::with_text_pct(96, 10).st(10),
+            Metrics::with_text_pct(96, 70).st(10)
+        );
+        assert_eq!(
+            Metrics::with_text_pct(96, 9999).st(10),
+            Metrics::with_text_pct(96, 160).st(10)
+        );
+    }
+
+    /// 档位表本身的自检：id 唯一、百分比在允许区间内且包含默认档。
+    #[test]
+    fn font_presets_are_sane() {
+        let ids: Vec<usize> = FONT_PRESETS.iter().map(|(id, _)| *id).collect();
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len(), "菜单 id 必须唯一");
+        for (_, pct) in FONT_PRESETS {
+            assert!(
+                (MIN_TEXT_PCT..=MAX_TEXT_PCT).contains(&pct),
+                "档位 {pct} 超出允许范围"
+            );
+        }
+        assert!(
+            FONT_PRESETS
+                .iter()
+                .any(|(_, p)| *p == crate::settings::DEFAULT_TEXT_PCT),
+            "必须有默认档"
+        );
+    }
+
+    #[test]
+    fn metrics_treat_invalid_dpi_as_96() {
+        assert_eq!(Metrics::new(0).sc(10), 10);
+        assert_eq!(Metrics::new(-5).sc(10), 10);
+        assert_eq!(Metrics::new(192).sc(10), 20); // 200%
+    }
+
+    /// 系统 DPI 未知时不能把条宽算成 0（旧代码 .min(0) 会做出 0 像素窗口）。
+    #[test]
+    fn max_strip_width_floor_is_never_zero() {
+        let m = Metrics::new(144);
+        let floored = 0i32.max(m.sc(MIN_STRIP_WIDTH));
+        assert_eq!(floored, 60);
+        assert!(floored > 0);
     }
 }
 

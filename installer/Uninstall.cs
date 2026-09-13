@@ -3,6 +3,7 @@ using System.Drawing;
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -91,20 +92,21 @@ namespace BtBatteryBarUninstall
             }
             catch { }
 
-            // 自删除（隐藏 cmd，不闪烁控制台）
+            // 自删除：正在运行的映像无法当场删除，用 MoveFileEx 标记为重启时删除。
+            // 不经过 cmd / shell，避免任何命令拼接（目录在重启时随自身一同清除）
             try
             {
                 string self = Application.ExecutablePath;
-                ProcessStartInfo psi = new ProcessStartInfo("cmd.exe",
-                    "/c ping 127.0.0.1 -n 2 > nul & del /f /q \"" + self + "\" & rd /s /q \"" + dir + "\"");
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = true;
-                psi.WindowStyle = ProcessWindowStyle.Hidden;
-                psi.WorkingDirectory = Path.GetTempPath();
-                Process.Start(psi);
+                MoveFileEx(self, null, MOVEFILE_DELAY_UNTIL_REBOOT);
+                MoveFileEx(dir, null, MOVEFILE_DELAY_UNTIL_REBOOT);
             }
             catch { }
         }
+
+        const int MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
     }
 
     class ConfirmForm : Form

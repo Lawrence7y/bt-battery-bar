@@ -1008,6 +1008,11 @@ pub fn is_sonix_vid(vid: u16) -> bool {
     vid == 0x0C45
 }
 
+/// 罗技：HID++ 2.0（Unifying / Lightspeed 接收器、USB 有线设备）。
+pub fn is_hidpp_vid(vid: u16) -> bool {
+    vid == 0x046D
+}
+
 pub fn is_known_24g_vid(vid: u16) -> bool {
     KNOWN_24G_VIDS.contains(&vid)
 }
@@ -1222,8 +1227,22 @@ pub fn sonix_status_request(output_len: u16) -> Vec<u8> {
     poke
 }
 
+/// 我们自己写入 FF60 的命令帧 `00 20 01 00 00...`。设备/固件把它当普通输入报文
+/// 回显时，字节 4 恰好是 0，会被误读成「电量 0%」——必须与真实应答区分开。
+fn is_eweadn_cmd_echo(report: &[u8]) -> bool {
+    report.len() >= 5
+        && report[0] == 0x00
+        && report[1] == 0x20
+        && report[2] == 0x01
+        && report[3] == 0x00
+        && report[4..].iter().all(|b| *b == 0)
+}
+
 /// EWEADN/Sonix 三模键盘电池应答（官方驱动同款协议，FF60/MI_03 通道）:
 /// `00 20 <echo> 00 PCT 00... CS`，CS = 前 31 字节累加和。
+///
+/// 校验和：尾字节 == 前面所有字节之和时接受；尾字节为 0 时按「该固件不带校验和」
+/// 兼容处理，但必须先排除我们自己命令帧的回显，否则回显帧会被读成 0%。
 pub fn parse_eweadn_battery(report: &[u8]) -> Option<u8> {
     if report.len() < 6 || report[0] != 0x00 || report[1] != 0x20 {
         return None;
@@ -1232,7 +1251,10 @@ pub fn parse_eweadn_battery(report: &[u8]) -> Option<u8> {
     if pct > 100 {
         return None;
     }
-    // 校验和（存在时）：前 len-1 字节累加 mod 256
+    if is_eweadn_cmd_echo(report) {
+        return None; // 回显的 0x20 命令帧，不是电量应答
+    }
+    // 校验和：前 len-1 字节累加 mod 256
     let last = report.len() - 1;
     let sum = report[..last].iter().fold(0u8, |a, &b| a.wrapping_add(b));
     if sum == report[last] || report[last] == 0 {
@@ -1256,7 +1278,7 @@ pub(crate) fn query_eweadn_battery(handle: HANDLE, input_len: u16, output_len: u
         if dbg0 {
             eprintln!(
                 "eweadn write {:?}: {:?}",
-                &cmd[..5],
+                &cmd[..cmd.len().min(5)],
                 w.as_ref().map(|_| "ok")
             );
         }
@@ -1956,6 +1978,39 @@ mod tests {
         assert_eq!(parse_eweadn_battery(&c), None);
     }
 
+    /// 回归：设备把我们的 `00 20 01 00 ...` 查询命令当输入报文回显时，
+    /// 不能读成 0%（旧实现在尾字节为 0 时放行，回显帧尾字节正是 0）。
+    #[test]
+    fn parse_eweadn_battery_rejects_own_command_echo() {
+        // 33 字节（FF60 in=33）与 65 字节（MI_03）两种回显长度
+        for len in [33usize, 65] {
+            let mut echo = vec![0u8; len];
+            echo[1] = 0x20;
+            echo[2] = 0x01;
+            assert_eq!(
+                parse_eweadn_battery(&echo),
+                None,
+                "len={len} 的命令回显必须被拒绝"
+            );
+        }
+        // 真实的 0% 应答带正确校验和，仍应被接受（回显与应答靠校验和区分）
+        let mut zero_pct = vec![0u8; 33];
+        zero_pct[1] = 0x20;
+        zero_pct[2] = 0x01;
+        zero_pct[4] = 0x00;
+        let sum: u8 = zero_pct[..32].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        // 校验和为 0x21（= 0x00+0x20+0x01），与回显帧的 0 不同
+        assert_eq!(sum, 0x21);
+        zero_pct[32] = sum;
+        assert_eq!(parse_eweadn_battery(&zero_pct), Some(0));
+        // 无校验和（尾字节 0）但确实携带电量的旧固件帧仍兼容
+        let mut legacy = vec![0u8; 33];
+        legacy[1] = 0x20;
+        legacy[2] = 0x01;
+        legacy[4] = 17;
+        assert_eq!(parse_eweadn_battery(&legacy), Some(17));
+    }
+
     use windows::Win32::Foundation::BOOLEAN;
 
     #[test]
@@ -2178,6 +2233,14 @@ mod tests {
         assert_eq!(parse_sonix_battery(&live), Some(14));
         let rid_f = vec![0x0F, 0x01, 0xFE, 42, 0];
         assert_eq!(parse_sonix_battery(&rid_f), Some(42));
+    }
+
+    #[test]
+    fn hidpp_vid_is_logitech_only() {
+        assert!(is_hidpp_vid(0x046D));
+        assert!(!is_hidpp_vid(0x0C45)); // Sonix
+        assert!(!is_hidpp_vid(0x373B)); // Compx
+        assert!(!is_hidpp_vid(0x0000));
     }
 
     #[test]

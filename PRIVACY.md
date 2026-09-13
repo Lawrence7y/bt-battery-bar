@@ -28,7 +28,7 @@ BtBatteryBar 是一款运行在本地的 Windows 桌面工具，用于在任务�
 程序仅通过 Windows 系统本地 API（WinRT GATT 电池服务、HID 接口）读取你**已配对蓝牙 / 2.4G 设备的电量百分比与设备名称**，这些信息：
 
 - 仅用于在屏幕上显示电量条；
-- 仅保存在本机注册表 `HKCU` 下的用户设置中（轮询间隔、开机自启、显示偏好等），**绝不出本机**；
+- 仅保存在本机：用户设置写入 `%LOCALAPPDATA%\BtBatteryBar\settings.json`，开机自启项写入注册表 `HKCU\...\Run`，另有一份本地排障日志 `%LOCALAPPDATA%\BtBatteryBar\debug.log`（含设备名/地址与电量，仅本机、上限 1 MiB 自动轮转），**绝不出本机**；
 - 可随时通过卸载程序完全清除。
 
 ### 权限说明
@@ -71,7 +71,7 @@ BtBatteryBar is a local Windows desktop utility that displays battery levels of 
 The app reads only the **battery percentage and device name of your already-paired Bluetooth / 2.4G devices** through local Windows system APIs (WinRT GATT Battery Service, HID interfaces). This information:
 
 - Is used solely to display the battery bar on your screen;
-- Is stored only in user settings under the local registry (`HKCU`) — polling interval, autostart, display preferences — and **never leaves your machine**;
+- Is stored only locally: settings in `%LOCALAPPDATA%\BtBatteryBar\settings.json`, the autostart entry under `HKCU\...\Run`, plus a local troubleshooting log at `%LOCALAPPDATA%\BtBatteryBar\debug.log` (device names/addresses and battery levels; local only, capped at 1 MiB with rotation) — and **never leaves your machine**;
 - Can be fully removed at any time by uninstalling the application.
 
 ### Permissions

@@ -24,3 +24,13 @@ msix/*.cer
 .vscode/
 .idea/
 *.swp
+
+# 打包载荷：由 tools/pack-msix.ps1 从 target/release 复制，不入库
+# （曾因把旧 exe 提交进库，导致商店包里的 exe 落后于源码/是 console 子系统）
+msix/layout/*.exe
+
+# Python 工具产物
+__pycache__/
+
+# AI 助手会话状态（非项目内容）
+.mimosa/

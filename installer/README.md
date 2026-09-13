@@ -39,13 +39,26 @@
 
 ## 构建
 
+**推荐：一条命令出齐所有发行物**（主程序 + 安装器 + zip）：
+
+```powershell
+pwsh tools\pack-release.ps1
+```
+
+它会：`cargo build --release` → **校验产物**（`PE Subsystem == 2` 且不依赖 VC++ 运行库，任一不满足立即中止）
+→ 复制到 `dist\`、`release\` 并同步 `dist\README.md` → 调用 `installeruild.bat` 重建安装器
+（并校验 `BtBatteryBar-Setup.exe` 里确实嵌入了**当前**主程序）→ 生成
+`releaset-battery-bar-<版本>-setup.zip`（便携版）与 `-installer.zip`（图形安装包）。
+
+也可以只做安装器这一步（主程序已在 `distt-battery-bar.exe` 时）：
+
 ```bat
-rem 在 installer 目录下执行（或任意目录执行 installer\build.bat）
 build.bat
 ```
 
-前提：Windows 10/11 x64，已安装 .NET Framework 4.x（系统自带）与 Rust（用于先构建主程序）。
-脚本使用 `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe` 编译，无需联网下载任何东西。
+前提：Windows 10/11 x64，已安装 .NET Framework 4.x（系统自带，用
+`%WINDIR%\Microsoft.NET\Framework644.0.30319\csc.exe` 编译，无需联网）与 Rust。
 
-主程序需先由 `cargo build --release` 构建并放到 `dist\bt-battery-bar.exe`，
-再运行 `build.bat` 生成安装包。
+> ⚠️ 不要手工 `copy` 主程序到 `dist\`：手工复制的 exe 曾落后于源码（甚至把 console 子系统的
+> 构建打进商店包，用户双击会弹出终端黑窗）。`pack-release.ps1` / `pack-msix.ps1` 里的校验就是为了
+> 杜绝这种情况，请始终通过脚本出包。
